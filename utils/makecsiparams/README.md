@@ -15,5 +15,17 @@ Usage: makecsiparams [OPTION...]
    -d delay     delay in us after each CSI operation
                 (really needed for 3x4, 4x3 and 4x4 configurations,
                 without it is enforced automatically)
+   -k           keep the current channel, i.e., do not retune the chip
+                (required to stay associated while collecting, makes -c optional)
+   -S           leave firmware scanning enabled
+                (scans retune the chip and interrupt the collection)
    -r           generate raw output (no base64)
+```
+
+`-k` and `-S` append two flag bytes to the parameter block, so the length passed
+to nexutil grows from 34 to 36 bytes (`nexutil -Iwlan0 -s500 -b -l36 -v...`).
+Firmware versions that predate these flags ignore the extra bytes. To avoid
+hardcoding the length, derive it from the raw output:
+```
+nexutil -Iwlan0 -s500 -b -l$(makecsiparams -k -C 1 -N 1 -r | wc -c) -v$(makecsiparams -k -C 1 -N 1)
 ```

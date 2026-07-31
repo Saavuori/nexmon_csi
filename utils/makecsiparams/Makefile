@@ -10,7 +10,7 @@ $(ODIR)/%.o: $(SRCS) $(DEPS)
 makecsiparams: $(OBJS)
 	$(CC) -o $@ $^ $(CFLAGS)
 
-ifneq ($(shell uname -m),$(filter $(shell uname -m), armv6l armv7l))
+ifneq ($(shell uname -m),$(filter $(shell uname -m), armv6l armv7l aarch64 arm64))
 install: libs/armeabi/makecsiparams
 	adb push $< /sdcard/
 	adb shell 'su -c "mount -o rw,remount /system"'

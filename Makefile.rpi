@@ -3,6 +3,7 @@ ifndef NEXMON_SETUP_ENV
 endif
 
 GIT_VERSION := $(shell git describe --abbrev=4 --dirty --always --tags)
+IFACE ?= wlan0
 include ../version.mk
 include $(FW_PATH)/definitions.mk
 
@@ -220,6 +221,24 @@ reload-full: reload-driver
 	@printf "\033[0;31m  DISABLE\033[0m Power Save\n"
 	$(Q)sudo iw dev wlan0 set power_save off
 	$(Q)nexutil -s86 -i -v0
+
+install-csi-tools: is-rpi
+	@printf "\033[0;31m  BUILDING\033[0m %s\n" "makecsiparams"
+	$(Q)make -C utils/makecsiparams
+	@printf "\033[0;31m  INSTALLING\033[0m %s\n" "makecsiparams"
+	$(Q)sudo make -C utils/makecsiparams install
+
+# Collect CSI without dropping the Wi-Fi connection. Requires wlan0 to be
+# associated already; pass extra makecsiparams options via CSIARGS, e.g.
+#   make -f Makefile.rpi csi-connected CSIARGS="-b 0x88 -m 00:11:22:33:44:55"
+csi-connected: is-rpi
+	$(Q)sudo utils/csi-connected.sh -i $(IFACE) $(CSIARGS)
+
+csi-stop: is-rpi
+	$(Q)sudo utils/csi-connected.sh -i $(IFACE) --stop
+
+csi-status: is-rpi
+	$(Q)sudo utils/csi-connected.sh -i $(IFACE) --status
 
 install-firmware: $(RAM_FILE) is-rpi
 	@printf "\033[0;31m  COPYING\033[0m %s => /lib/firmware/nexmon/%s\n" $(RAM_FILE) $(RAM_FILE)

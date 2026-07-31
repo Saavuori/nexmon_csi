@@ -31,6 +31,10 @@ void st16be (uint16_t value, uint16_t *addr)
 #define MAX_MAC_ADDRESS 4
 #define	DEFAULT_DELAY_US 50
 
+/* optional flags, appended to the parameter block only if one of them is set */
+#define CSI_FLAG_KEEP_CHANSPEC 0x0001   /* capture on the channel the chip is already tuned to */
+#define CSI_FLAG_ALLOW_SCAN    0x0002   /* leave firmware scanning enabled */
+
 int countbit (uint32_t val)
 {
     int counter = 0;
@@ -80,7 +84,14 @@ void usage ()
         "   -d delay     delay in us after each CSI operation\n"
         "                (really needed for 3x4, 4x3 and 4x4 configurations,\n"
         "                without it is enforced automatically)\n"
+        "   -k           keep the current channel, i.e., do not retune the chip\n"
+        "                (required to stay associated while collecting, makes -c optional)\n"
+        "   -S           leave firmware scanning enabled\n"
+        "                (scans retune the chip and interrupt the collection)\n"
         "   -r           generate raw output (no base64)\n"
+        "\n"
+        "-k and -S append two bytes to the parameter block, so pass the resulting\n"
+        "length to nexutil, e.g. -l36 instead of -l34.\n"
         "";
     fprintf (stdout, "%s\n", usage_str);
 }
@@ -116,17 +127,26 @@ int main (int argc, char *argv[]) {
     uint16_t chanspec = 0;
     char *endptr = NULL;
     int doraw = 0;
+    uint16_t flags = 0;
 
     if(argc < 2) {
         usage ();
         goto finish;
     }
 
-    while ((c = getopt(argc, argv, "hre:m:b:c:C:N:d:")) != EOF) {
+    while ((c = getopt(argc, argv, "hkrSe:m:b:c:C:N:d:")) != EOF) {
         switch (c) {
             case 'h':
                 usage ();
                 goto finish;
+
+            case 'k':
+                flags |= CSI_FLAG_KEEP_CHANSPEC;
+                break;
+
+            case 'S':
+                flags |= CSI_FLAG_ALLOW_SCAN;
+                break;
 
             case 'r':
                 doraw = 1;
@@ -232,11 +252,11 @@ int main (int argc, char *argv[]) {
     p.csi_collect = enable;
 
     if (enable != 0) {
-        if (chanspec == 0) {
+        if (chanspec == 0 && !(flags & CSI_FLAG_KEEP_CHANSPEC)) {
             fprintf (stderr, "No channel given\n");
             goto finish_error;
         }
-    
+
         if (nssmask == 0 || coremask == 0) {
             fprintf (stderr, "No nssmask and/or coremask given\n");
             goto finish_error;
@@ -251,15 +271,25 @@ int main (int argc, char *argv[]) {
         }
     }
 
-    uint8_t *base64p = (uint8_t *) &p;
+    // the flags are optional so that parameter blocks stay compatible with
+    // firmware versions that do not know about them; only append them if used
+    uint8_t buf[sizeof(p) + sizeof(flags)];
+    int len = sizeof(p);
+    memcpy (buf, &p, sizeof(p));
+    if (flags != 0) {
+        buf[len + 0] = flags & 0xff;
+        buf[len + 1] = (flags >> 8) & 0xff;
+        len += sizeof(flags);
+    }
+
+    uint8_t *base64p = buf;
 
     if (doraw) {
-        fwrite (base64p, sizeof(p), 1, stdout);
+        fwrite (base64p, len, 1, stdout);
         goto finish;
     }
 
     int jj, kk;
-    int len = sizeof(p);
     for (jj = 0; jj < len; jj += 3) {
         uint32_t val = 0;
         int parts = (len - jj);
@@ -287,6 +317,8 @@ int main (int argc, char *argv[]) {
     retval = 1;
 
   finish:
-    return 0;
+    // report failures so that callers can abort instead of feeding an empty
+    // parameter string to nexutil
+    return retval;
 }
 // printf ${string} | xxd -r -p  | base64
