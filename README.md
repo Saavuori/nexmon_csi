@@ -27,7 +27,7 @@ After following the [getting started](#getting-started) guide for your device be
     m+IBEQGIAgAAESIzRFWqu6q7qrsAAAAAAAAAAAAAAAAAAA==
     ```
    For a full list of possible parameters run `makecsiparams -h`.
-2. *bcm43455c0 only*: make sure wpa_supplicant is not running: `pkill wpa_supplicant`
+2. *bcm43455c0 only*: make sure wpa_supplicant is not running: `pkill wpa_supplicant`. If you want to keep the Wi-Fi connection instead, follow [staying connected to Wi-Fi while collecting CSI](#staying-connected-to-wi-fi-while-collecting-csi-raspberry-pi).
 3. Make sure your interface is up: `ifconfig wlan0 up` (replace wlan0 with your interface name)
 4. Configure the extractor using nexutil and the generated parameters (adapt the argument of -v with your parameters):
     ```
@@ -45,6 +45,62 @@ After following the [getting started](#getting-started) guide for your device be
 
     **bcm4366c0**: `/usr/sbin/wl -i eth6 monitor 1`
 6. Collect CSI by listening on UDP socket 5500, e.g. by using tcpdump: `tcpdump -i wlan0 dst port 5500`. There will be one UDP packet per configured core and spatial stream for each incoming frame matching the configured filter.
+
+## Staying connected to Wi-Fi while collecting CSI (Raspberry Pi)
+
+The procedure above deliberately gives up the Wi-Fi connection, but that is not a
+requirement of the extractor itself. CSI is handed to the host as ordinary UDP
+packets on `wlan0` regardless of the interface mode - monitor mode is only needed
+to make the chip accept frames that are not addressed to the Pi. Three things in
+the default procedure break the association:
+
+* `pkill wpa_supplicant` obviously terminates the connection.
+* Enabling monitor mode takes the chip out of managed mode.
+* `nexutil -s500` retunes the chip to the chanspec passed to `makecsiparams -c`.
+  If that chanspec is not the one your access point uses, the Pi stops hearing
+  beacons and gets disconnected.
+
+To keep the connection, capture on the channel your access point already uses
+and tell the extractor not to retune with `makecsiparams -k`. Scanning is still
+suppressed while collecting, because a scan moves the chip to other channels and
+interrupts the capture; `makecsiparams -S` keeps it enabled if you need roaming
+more than you need a gap-free capture.
+
+Staying associated fits the case where you generate the traffic yourself, e.g.
+pinging or running `iperf` against the access point and reading the CSI of your
+own frames, and you keep SSH access to the Pi over the same interface. If you
+need CSI of frames between two other devices, the chip has to accept frames it
+would otherwise discard, which still means monitor mode and therefore no
+association.
+
+`utils/csi-connected.sh` performs the whole procedure. It reads the channel from
+the running association, disables Wi-Fi power save (which would otherwise let the
+chip doze between beacons and show up as gaps in the CSI stream) and configures
+the extractor:
+
+```
+sudo utils/csi-connected.sh -C 0x1 -N 0x1 -b 0x88
+tcpdump -i wlan0 dst port 5500 -w csi.pcap
+sudo utils/csi-connected.sh --stop
+```
+
+`--stop` also re-enables scanning, `--status` reports the current channel and
+collection state. The same steps are available as `make -f Makefile.rpi
+csi-connected` / `csi-stop` / `csi-status`.
+
+Doing it by hand comes down to:
+```
+iw dev wlan0 info                         # read "channel <ch> ... width: <bw> MHz"
+iw dev wlan0 set power_save off
+nexutil -Iwlan0 -s86 -i -v0
+PARAMS=$(makecsiparams -k -c <ch>/<bw> -C 0x1 -N 0x1 -b 0x88)
+nexutil -Iwlan0 -s500 -b -l36 -v$PARAMS   # 36, not 34: -k adds two flag bytes
+```
+
+Note that you only receive CSI for frames that reach the Pi on that one channel,
+and that a roam or a channel switch by the access point ends the capture. Keep
+NetworkManager from putting the interface to sleep again with
+`nmcli connection modify <name> wifi.powersave 2`.
 
 ## Analyzing the CSI
 
