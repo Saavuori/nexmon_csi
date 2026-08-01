@@ -63,11 +63,37 @@ After following the [getting started](#getting-started) guide for your device be
 
 ## Staying connected to Wi-Fi while collecting CSI (Raspberry Pi)
 
-The procedure above deliberately gives up the Wi-Fi connection, but that is not a
-requirement of the extractor itself. CSI is handed to the host as ordinary UDP
-packets on `wlan0` regardless of the interface mode - monitor mode is only needed
-to make the chip accept frames that are not addressed to the Pi. Three things in
-the default procedure break the association:
+> **The association stays up. The link does not keep working.**
+>
+> Keeping the interface associated is not the same as keeping it usable, and on
+> the bcm43455c0 it will not be usable. The ucode deafens the receiver for the
+> whole duration of every CSI dump, so the chip stops hearing the channel each
+> time it extracts. Inbound unicast data is hit hardest, because it owes the AP
+> a SIFS-timed ACK and arrives back-to-back in A-MPDUs; beacons are broadcast,
+> unacknowledged and 100 ms apart, so the association itself barely notices.
+> That is why `iw dev wlan0 link` can keep saying *Connected to* while pings to
+> your gateway are dropped.
+>
+> This is inherent to the extractor, not a bug and not something the host can
+> work around. Upstream's maintainer has said the shipped patch "is optimized to
+> work in monitor mode" and that a non-monitor receiver "would require a
+> slightly different patch"
+> ([discussion #389](https://github.com/seemoo-lab/nexmon_csi/discussions/389)),
+> and the same symptom was reported on kernel 5.4 back in
+> [issue #201](https://github.com/seemoo-lab/nexmon_csi/issues/201) - it is not
+> new and not specific to recent kernels.
+>
+> **Do not run this over SSH on the interface you are capturing on.** Use
+> Ethernet, or the other band, or a serial console.
+
+What this section buys you is *not* a working network connection - it is CSI
+collection without tearing the interface down, on the channel the AP already
+uses, and a single command to put everything back. That is genuinely useful when
+you generate the traffic yourself and read the CSI of your own frames, but budget
+for heavy packet loss while collection is armed.
+
+The standard procedure gives up the connection through three separate
+mechanisms, and this one avoids all three:
 
 * `pkill wpa_supplicant` obviously terminates the connection.
 * Enabling monitor mode takes the chip out of managed mode.
@@ -75,18 +101,24 @@ the default procedure break the association:
   If that chanspec is not the one your access point uses, the Pi stops hearing
   beacons and gets disconnected.
 
-To keep the connection, capture on the channel your access point already uses
-and tell the extractor not to retune with `makecsiparams -k`. Scanning is still
+To avoid the last one, capture on the channel your access point already uses and
+tell the extractor not to retune with `makecsiparams -k`. Scanning is still
 suppressed while collecting, because a scan moves the chip to other channels and
 interrupts the capture; `makecsiparams -S` keeps it enabled if you need roaming
 more than you need a gap-free capture.
 
-Staying associated fits the case where you generate the traffic yourself, e.g.
-pinging or running `iperf` against the access point and reading the CSI of your
-own frames, and you keep SSH access to the Pi over the same interface. If you
-need CSI of frames between two other devices, the chip has to accept frames it
-would otherwise discard, which still means monitor mode and therefore no
-association.
+**Always pass a filter.** With neither `-b` nor `-m` the extractor dumps CSI for
+every frame it hears on the channel - including other people's BSSs - and pays a
+deaf window for each one. That is the worst case for both your link and your
+capture, so `csi-connected.sh` refuses to start without one unless you insist
+with `--unfiltered`. A 20 MHz channel also costs 5 chunks per dump against 19 at
+80 MHz, so it is markedly gentler.
+
+Two smaller things worth knowing: `makecsiparams -d` / `csi-connected.sh -d`
+sets `FIFODELAY`, which the **bcm43455c0 ucode never reads** - it is implemented
+only for the bcm4339, so it does nothing on a Raspberry Pi. And if you need CSI
+of frames between two *other* devices, the chip has to accept frames it would
+otherwise discard, which still means monitor mode and therefore no association.
 
 `utils/csi-connected.sh` performs the whole procedure. It reads the channel from
 the running association, disables Wi-Fi power save (which would otherwise let the

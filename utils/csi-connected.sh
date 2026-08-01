@@ -1,17 +1,41 @@
 #!/bin/sh
 #
-# Configure the Nexmon CSI extractor on a Raspberry Pi without losing the
-# Wi-Fi association.
+# Configure the Nexmon CSI extractor on a Raspberry Pi while keeping the Wi-Fi
+# association up.
 #
-# The regular setup procedure kills wpa_supplicant, forces the chip onto the
-# channel passed to makecsiparams and switches to monitor mode, all of which
-# tear down an existing connection. Instead this script derives the channel
-# from the running association, tells the extractor to stay on it
-# (makecsiparams -k) and only disables the power save modes that would
-# otherwise make the chip sleep through the frames we want CSI for.
+# READ THIS FIRST: the association surviving is not the same thing as the link
+# still working, and on the bcm43455c0 it will not still be working.
 #
-# CSI is delivered as UDP packets on the regular interface, so no monitor
-# interface is needed and the interface keeps carrying normal traffic.
+# The shipped ucode deafens the PHY for the whole duration of every CSI dump so
+# that the channel estimate table cannot be overwritten while it is being read
+# out. Look for enable_carrier_search in
+# src/csi.ucode.bcm43455c0.7_45_189.patch: it forces ClassifierCtrl[2:0] to 4
+# and writes ed_crsEn = 0, and it is the same routine that ioctl 502
+# ("force deaf mode") calls. Every dump therefore costs a receive window, and
+# inbound unicast data pays for it first, because that traffic owes the AP a
+# SIFS-timed ACK and arrives back to back in A-MPDUs. Beacons are broadcast,
+# unacknowledged and 100 ms apart, so the association itself hardly notices.
+# That asymmetry is exactly why the link can look healthy - iw still reports
+# "Connected to" - while nothing gets through.
+#
+# This is by design, not a bug, and it is not fixable from the host side.
+# Upstream's own procedure gives the connection up (pkill wpa_supplicant, then
+# monitor mode) and the maintainer has said the shipped patch "is optimized to
+# work in monitor mode", with a non-monitor receiver needing "a slightly
+# different patch" (seemoo-lab/nexmon_csi discussion #389). It is also not new
+# and not kernel specific: the identical symptom was reported on kernel 5.4 in
+# issue #201.
+#
+# So treat this script as "collect CSI without tearing the interface down",
+# which works, and NOT as "collect CSI and keep using the network", which does
+# not. Filtering is what makes the difference in practice: with no -b and no -m
+# the extractor dumps for every frame it hears on the channel, including other
+# people's BSSs, which is the worst case. Narrow it down and the deaf windows
+# get correspondingly rarer. A 20 MHz channel also costs 5 chunks per dump
+# instead of 19 at 80 MHz.
+#
+# CSI itself is delivered as UDP packets on the regular interface, so no
+# monitor interface is needed.
 
 set -e
 
@@ -22,6 +46,7 @@ MACS=
 BYTE=
 DELAY=
 ALLOW_SCAN=0
+UNFILTERED=0
 ACTION=start
 
 usage() {
@@ -35,12 +60,20 @@ Collect CSI while staying associated to an access point.
   -N nssmask    bitmask of spatial streams to capture (default: $NSSMASK)
   -m addrs      comma separated list of source MAC addresses to filter for
   -b byte       only collect for frames starting with this byte, e.g. 0x88
-  -d delay      delay in us after each CSI operation
+  -d delay      delay in us after each CSI operation. NOTE: the bcm43455c0
+                ucode never reads this value, so it does nothing on a
+                Raspberry Pi. Only the bcm4339 ucode implements it.
   --allow-scan  leave firmware scanning enabled; scans retune the chip and
                 interrupt the collection, but roaming and 'iw scan' keep working
+  --unfiltered  collect for every frame on the channel. Required to start
+                without -b or -m, because unfiltered collection deafens the
+                receiver constantly and will stall inbound traffic.
   --stop        stop the collection and re-enable scanning
   --status      show the current state and exit
   -h, --help    print this message
+
+Expect inbound throughput to suffer while collection is armed; see the comment
+at the top of this script for why that is inherent to the extractor.
 
 Examples:
   $0 -C 0x1 -N 0x1 -b 0x88
@@ -67,6 +100,7 @@ while [ $# -gt 0 ]; do
         -b) BYTE=$2; shift 2 ;;
         -d) DELAY=$2; shift 2 ;;
         --allow-scan) ALLOW_SCAN=1; shift ;;
+        --unfiltered) UNFILTERED=1; shift ;;
         --stop) ACTION=stop; shift ;;
         --status) ACTION=status; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -262,6 +296,33 @@ esac
 
 is_connected || die "$IFACE is not associated - connect to your access point first"
 
+# Unfiltered collection is the pathological case. With APPLY_PKT_FILTER and
+# N_CMP_SRC_MAC both zero the ucode falls through to 'mov 1, DUMP_CSI' for every
+# frame of 30 bytes or more that it hears - not just frames addressed to this
+# Pi, every frame on the channel, other BSSs included - and each of those dumps
+# deafens the receiver. Making that the default was a mistake; it is the setting
+# most likely to convince someone the firmware is broken.
+if [ "$UNFILTERED" = "0" ] && [ -z "$MACS" ] && [ -z "$BYTE" ]; then
+    cat >&2 <<EOF
+error: refusing to arm the extractor with no filter
+
+Without -b or -m the extractor dumps CSI for every frame on the channel, and it
+goes deaf for the duration of each dump, so inbound traffic on $IFACE will stall
+almost completely.
+
+Pick a filter:
+  -b 0x88                      only QoS data frames
+  -m 00:11:22:33:44:55         only frames from one transmitter
+
+or pass --unfiltered if losing the link is genuinely what you want.
+EOF
+    exit 1
+fi
+
+if [ -n "$DELAY" ]; then
+    warn "-d is accepted but the bcm43455c0 ucode never reads FIFODELAY, so it has no effect here"
+fi
+
 set -- $(read_chanspec)
 CHANNEL=$1
 BANDWIDTH=$2
@@ -288,8 +349,15 @@ else
     warn "chanspec $CHANNEL/$BANDWIDTH not accepted by makecsiparams, capturing on the current channel anyway"
     PARAMS=$(makecsiparams "$@") || die "makecsiparams failed"
 fi
+# 36, not 34: the two trailing flag bytes carry CSI_FLAG_KEEP_CHANSPEC. The
+# firmware only reads them when the block is long enough to hold them
+# (src/ioctl.c: len >= sizeof(struct params)), so a 34 byte block is not a
+# harmless older format - it silently means "flags = 0", the extractor retunes
+# the chip to the chanspec in the block, and the association is torn down. That
+# is the one failure this script exists to avoid, so insist on the long form.
 LEN=$(makecsiparams "$@" -r | wc -c | awk '{print $1}')
-[ "$LEN" -ge 34 ] 2>/dev/null || die "unexpected parameter block length '$LEN'"
+[ "$LEN" -ge 36 ] 2>/dev/null || \
+    die "makecsiparams produced a $LEN byte block; -k did not add the flag bytes, so this build is too old for this script"
 
 nexutil -I"$IFACE" -s500 -b -l"$LEN" -v"$PARAMS" >/dev/null || true
 
@@ -312,6 +380,15 @@ if [ "$ALLOW_SCAN" = "0" ]; then
     echo "note: scanning is suppressed until you run '$0 --stop'"
 fi
 
-echo
-echo "capture with:"
-echo "  tcpdump -i $IFACE dst port 5500 -w csi.pcap"
+# Say this every time. The association staying up is the thing that misleads
+# people into reporting the resulting packet loss as a firmware bug.
+cat <<EOF
+
+The link is still associated, but do not expect it to carry traffic normally:
+the chip goes deaf during every CSI dump, and inbound unicast data is what
+suffers first. Check with 'ping <your gateway>' - loss here is expected, not a
+fault, and '$0 --stop' restores it.
+
+capture with:
+  tcpdump -i $IFACE dst port 5500 -w csi.pcap
+EOF
