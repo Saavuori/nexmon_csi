@@ -83,6 +83,59 @@ done
 
 ip link show "$IFACE" >/dev/null 2>&1 || die "interface '$IFACE' does not exist"
 
+# nexutil hands our parameter block to the firmware through the brcmfmac driver,
+# and which transport it uses is fixed when nexutil is compiled. Only one of the
+# three works on a driver that is not nexmon's own:
+#
+#   -DUSE_NETLINK      the default. Needs the netlink socket that only nexmon's
+#                      patched brcmfmac creates, otherwise the socket cannot be
+#                      opened at all: 'socket error (93: Protocol not supported)'
+#   without it         private ioctls that mainline brcmfmac no longer handles,
+#                      which answers 'error ret=-1 errno=95'
+#   USE_VENDOR_CMD=1   an nl80211 vendor command, which the stock driver serves
+#
+# Raspberry Pi OS has shipped the stock driver since it moved past kernel 5.10, so
+# there nexutil has to be the vendor command build. Picking the wrong one is easy
+# to miss because nexutil reports the failure on stderr but still exits 0, which
+# is why nothing below trusts its exit status: every write is read back instead.
+
+# A plain chanspec query. Any brcmfmac firmware answers it, so it tells us
+# whether the transport works without saying anything about the firmware.
+transport_works() {
+    nexutil -I"$IFACE" -k 2>/dev/null | grep -q 'chanspec'
+}
+
+# ioctl 501 exists only in the nexmon CSI firmware and returns csi_collect.
+# Empty means the firmware did not answer, '0'/'1' is the current state.
+csi_collect_state() {
+    nexutil -I"$IFACE" -g501 -i 2>/dev/null |
+        awk '{ for (i = NF; i >= 1; i--) if ($i ~ /^-?[0-9]+$/) { print $i + 0; exit } }'
+}
+
+require_firmware_access() {
+    if ! transport_works; then
+        echo "error: nexutil cannot reach the firmware on $IFACE" >&2
+        cat >&2 <<EOF
+
+The nexutil in your PATH speaks a transport this driver does not provide. A stock
+brcmfmac - which is what recent Raspberry Pi OS loads - only accepts firmware
+commands as nl80211 vendor commands, so nexutil has to be built for those:
+
+  sudo apt install libnl-3-dev libnl-genl-3-dev
+  cd \$NEXMON_ROOT/utilities/nexutil
+  make clean && make USE_VENDOR_CMD=1 && sudo make install
+
+'make clean' matters: objects left from an earlier build keep the old transport.
+Then 'nexutil -I$IFACE -k' has to print a chanspec before this script can work.
+EOF
+        exit 1
+    fi
+
+    # ioctl 501 also needs the chip to be up, so say so rather than blaming the
+    # firmware for what may just be a down interface
+    [ -n "$(csi_collect_state)" ] || die "nexutil reaches $IFACE but ioctl 501 gets no answer - either the interface is down ('ip link set $IFACE up') or the running firmware is not the nexmon CSI build ('make -f Makefile.rpi install-firmware', then reload the driver)"
+}
+
 # Reads "<channel> <bandwidth>" from the running association, e.g. "36 80".
 read_chanspec() {
     iw dev "$IFACE" info 2>/dev/null | awk '
@@ -111,11 +164,23 @@ show_status() {
     echo "channel:    ${1:-unknown} @ ${2:-unknown} MHz"
     chanspec=$(nexutil -I"$IFACE" -k 2>/dev/null | sed 's/^chanspec: *//')
     echo "chanspec:   ${chanspec:-unavailable}"
-    collect=$(nexutil -I"$IFACE" -g501 -i 2>/dev/null) || true
-    echo "csi:        ${collect:-unavailable}"
+    collect=$(csi_collect_state)
+    if [ -n "$collect" ]; then
+        echo "nexutil:    reaches the firmware"
+        echo "csi:        $collect"
+    elif transport_works; then
+        echo "nexutil:    reaches the firmware, but it is not the nexmon CSI build"
+        echo "csi:        unavailable"
+    else
+        echo "nexutil:    cannot reach the driver, rebuild it with USE_VENDOR_CMD=1"
+        echo "csi:        unavailable"
+    fi
     powersave=$(iw dev "$IFACE" get power_save 2>/dev/null | sed -n 's/.*Power save: //p')
     echo "power save: ${powersave:-unknown}"
 }
+
+# --status is a diagnosis of its own and has to run even when nothing works
+[ "$ACTION" = "status" ] || require_firmware_access
 
 case "$ACTION" in
 status)
@@ -126,8 +191,10 @@ stop)
     # csi_collect = 0 also makes the firmware re-enable scanning
     PARAMS=$(makecsiparams -e 0) || die "makecsiparams failed"
     LEN=$(makecsiparams -e 0 -r | wc -c | awk '{print $1}')
-    nexutil -I"$IFACE" -s500 -b -l"$LEN" -v"$PARAMS" >/dev/null || \
-        die "nexutil could not reach the extractor on $IFACE"
+    nexutil -I"$IFACE" -s500 -b -l"$LEN" -v"$PARAMS" >/dev/null || true
+    STATE=$(csi_collect_state)
+    [ "$STATE" = "0" ] || \
+        die "the extractor did not take the stop request (csi_collect reads back as '${STATE:-nothing}')"
     echo "CSI collection stopped, scanning re-enabled on $IFACE"
     exit 0
     ;;
@@ -164,8 +231,13 @@ fi
 LEN=$(makecsiparams "$@" -r | wc -c | awk '{print $1}')
 [ "$LEN" -ge 34 ] 2>/dev/null || die "unexpected parameter block length '$LEN'"
 
-nexutil -I"$IFACE" -s500 -b -l"$LEN" -v"$PARAMS" >/dev/null || \
-    die "nexutil could not configure the extractor - is the nexmon CSI firmware loaded?"
+nexutil -I"$IFACE" -s500 -b -l"$LEN" -v"$PARAMS" >/dev/null || true
+
+# The exit status above means nothing, so confirm the extractor really is armed
+# by reading csi_collect out of the firmware's shared memory (ioctl 501).
+STATE=$(csi_collect_state)
+[ "$STATE" = "1" ] || \
+    die "the extractor did not take the configuration (csi_collect reads back as '${STATE:-nothing}')"
 
 # give the association a moment to fall over if the chip did move channel
 sleep 2

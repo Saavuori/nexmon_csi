@@ -88,6 +88,43 @@ sudo utils/csi-connected.sh --stop
 collection state. The same steps are available as `make -f Makefile.rpi
 csi-connected` / `csi-stop` / `csi-status`.
 
+### nexutil has to match your driver
+
+Everything here goes through `nexutil`, which hands the parameter block to the
+firmware through the `brcmfmac` driver. Which transport it uses is decided when
+`nexutil` is compiled, and only one of the three reaches a driver that is not
+nexmon's own:
+
+| Build | Transport | Works with |
+|---|---|---|
+| `make` (default, `-DUSE_NETLINK`) | netlink socket | nexmon's patched `brcmfmac`, which is the only thing that creates that socket. Against any other driver the socket cannot even be opened: `nex_init_netlink: socket error (93: Protocol not supported)` |
+| built without `-DUSE_NETLINK` | private ioctls | nexmon's patched `brcmfmac`. Mainline dropped the ioctl handler these need and answers `__nex_driver_io: error ret=-1 errno=95` (`EOPNOTSUPP`) |
+| `make USE_VENDOR_CMD=1` | nl80211 vendor command | the stock `brcmfmac`, i.e. every Raspberry Pi OS past kernel 5.10 |
+
+The patched driver in this repository covers kernels 4.19, 5.4 and 5.10 only, so
+on anything newer - Raspberry Pi OS bookworm and trixie, or a Pi 5 - the vendor
+command build is the one you want:
+
+```
+sudo apt install libnl-3-dev libnl-genl-3-dev
+cd $NEXMON_ROOT/utilities/nexutil
+make clean && make USE_VENDOR_CMD=1 && sudo make install
+```
+
+`make clean` is not optional: an object file left from an earlier build keeps the
+old transport. `make -f Makefile.rpi install-csi-tools` does all of this for you.
+
+Check it with `nexutil -Iwlan0 -k`, which has to print a chanspec, and then with
+`sudo utils/csi-connected.sh --status`, which reports whether `nexutil` reaches
+the firmware and whether that firmware is the CSI build.
+
+This is worth verifying before anything else, because `nexutil` prints transport
+failures on stderr but **still exits 0**. A script that only checks its exit
+status will report success while having configured nothing, and `tcpdump -i wlan0
+dst port 5500` then stays silent for a reason that has nothing to do with your
+capture settings. `csi-connected.sh` therefore ignores the exit status and reads
+`csi_collect` back out of the firmware instead.
+
 Doing it by hand comes down to:
 ```
 iw dev wlan0 info                         # read "channel <ch> ... width: <bw> MHz"
@@ -212,6 +249,7 @@ This install instruction works only with devices based on ARM processors with 64
 <summary>Why don't I see any CSI packets?</summary>
 
 > There are quite a few reasons why this might happen. Check the following points to avoid usual pitfalls.
+> * First confirm that `nexutil` configured anything at all. It prints transport failures on stderr but still exits 0, so a `nexutil -s500 ...` that reached nothing looks exactly like one that succeeded. `nexutil -Iwlan0 -g501 -i` has to read back the `csi_collect` you asked for; if it prints nothing, see [nexutil has to match your driver](#nexutil-has-to-match-your-driver) - on kernels newer than 5.10 `nexutil` must be built with `USE_VENDOR_CMD=1`.
 > * Make sure you are capturing (and transmitting) on the correct channel. Also check if the chip tuned to the chanspec given by `makecsiparams -c` during configuration of the extractor (after running `nexutil -s500 ...`) by fetching the current chanspec with `nexutil -k`. If a wrong chanspec is returned you might need to add the desired chanspec to `src/regulations.c: additional_valid_chanspecs[]` first, to allow tuning to it. Returned chanspec `0x6863 85/160` probably means the chip or interface is not up. Also disable any other application that might try to change the channel, e.g. `wpa_supplicant`.
 > * If using the MAC address filter option, confirm the correctness of the given addresses.
 > * If using the byte filter option, ensure the specified byte is not faulty.
