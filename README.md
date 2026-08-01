@@ -9,9 +9,24 @@ on the Broadcom Wi-Fi Chips listed below.
 WiFi Chip   | Firmware Version  | Used in
 ----------- | ----------------- | --------------------
 bcm4339     | 6_37_34_43        | Nexus 5
-bcm43455c0  | 7_45_189          | Raspberry Pi 3B+/4B/5
+bcm43455c0  | 7_45_189          | Raspberry Pi 3B+/4B/5, CM4/CM5, Pi 500
 bcm4358     | 7_112_300_14_sta  | Nexus 6P
 bcm4366c0   | 10_10_122_20      | Asus RT-AC86U
+
+The firmware version in that table is the version this project patches, **not**
+a version your operating system has to be shipping. The patched image replaces
+whatever firmware the distribution installed, so a Raspberry Pi OS that ships
+7.45.265 still runs the 7.45.189 CSI build afterwards. That also means 7_45_189
+is the only 43455 firmware you can build from: the CSI hooks are placed at
+addresses reverse engineered for that one image (see the `at(...)` lists in
+`src/ioctl.c` and `src/csi_extractor.c`), and no addresses have been reversed
+for the newer 43455 firmware directories that exist in nexmon. Building from
+one of those produces an image with no extractor in it, so `Makefile.rpi` now
+refuses instead.
+
+Every Raspberry Pi in that row carries the same CYW43455, which is why the Pi 5
+needs no new firmware port - what it needs is the driver and install handling
+described under [Raspberry Pi 5 and current Raspberry Pi OS](#raspberry-pi-5-and-current-raspberry-pi-os).
 
 ## Be careful
 
@@ -180,7 +195,69 @@ The following steps will get you started on Xubuntu 16.04 LTS:
 
 ## bcm43455c0
 
-_Update:_ We've added a Makefile ([`Makefile.rpi`](https://github.com/seemoo-lab/nexmon_csi/blob/dd6767ec25c32d9b1d904197167f8c04ae79122f/Makefile.rpi)) dedicated to Raspberry Pi OS with recent kernel versions that no longer require a modified `brcmfmac` driver (that support vendor commands). A tutorial on using Nexmon CSI on recent kernel versions and additionally the Raspberry Pi 5 can be found in [discussion #395](https://github.com/seemoo-lab/nexmon_csi/discussions/395#discussion-9196947).
+_Update:_ We've added a Makefile ([`Makefile.rpi`](Makefile.rpi)) dedicated to Raspberry Pi OS with recent kernel versions that no longer require a modified `brcmfmac` driver (that support vendor commands). A tutorial on using Nexmon CSI on recent kernel versions and additionally the Raspberry Pi 5 can be found in [discussion #395](https://github.com/seemoo-lab/nexmon_csi/discussions/395#discussion-9196947).
+
+### Raspberry Pi 5 and current Raspberry Pi OS
+
+Use this path on anything past kernel 5.10 - Raspberry Pi OS bookworm and
+trixie, and every Pi 5, CM5 and Pi 500. The [legacy procedure](#raspberry-pi-os-with-kernel-419-54-or-510)
+below does not apply: it builds a patched `brcmfmac`, and this repository only
+carries driver sources for 4.19, 5.4 and 5.10.
+
+None of that is a problem, because nothing here actually needs the patched
+driver. The stock `brcmfmac` accepts firmware commands as nl80211 vendor
+commands, and CSI comes back as ordinary UDP packets, so the only thing that has
+to change is which transport `nexutil` speaks.
+
+```
+make -f Makefile.rpi install-csi-tools   # nexutil (USE_VENDOR_CMD=1) + makecsiparams
+make -f Makefile.rpi install-firmware    # build, activate, reload, verify
+```
+
+`install-firmware` does the whole job now, including the two steps that used to
+be left to the reader and failed quietly when skipped:
+
+* it points the `cyfmac43455-sdio.bin` Debian *alternative* at the patched image
+  rather than copying over `/lib/firmware/brcm/brcmfmac43455-sdio.bin`. That
+  path is a symlink into `cypress/`, so copying onto it destroys the packaged
+  firmware and leaves nothing to restore. It also looks up where the alternative
+  keeps its link instead of assuming, because bookworm uses `/lib/firmware` and
+  trixie `/usr/lib/firmware`.
+* it reloads the driver and then **checks the firmware banner in `dmesg`**. A
+  chip only reads its firmware while the driver attaches, so installing an image
+  without a reload changes nothing at all, and until now nothing said so.
+
+The reload takes the Wi-Fi link down, so if you are working over `wlan0` rather
+than Ethernet, install without it and reload once you are back on the console:
+
+```
+make -f Makefile.rpi install-firmware RELOAD_DRIVER=0
+```
+
+To undo everything, `make -f Makefile.rpi restore-wifi`. That switches the
+alternative back to the packaged firmware, or restores the backup it took if
+your distribution never registered one - `--auto` on its own would otherwise
+reselect the CSI image and report success.
+
+Two things about the reload are worth knowing if you do it by hand. Kernel 6.2
+split firmware selection out of `brcmfmac` into per-vendor modules, so on 6.6
+and 6.12 you have to remove `brcmfmac_wcc` before `brcmfmac` will come out,
+while on the 6.1 kernel bookworm originally shipped that module does not exist
+and `modprobe -r brcmfmac_wcc` simply fails. [`utils/reload-brcmfmac.sh`](utils/reload-brcmfmac.sh)
+handles both by looking at what is loaded:
+
+```
+sudo utils/reload-brcmfmac.sh -i wlan0
+```
+
+Raspberry Pi OS has used NetworkManager since bookworm, so `pkill wpa_supplicant`
+no longer does what step 2 of [Usage](#usage) describes - use
+`sudo nmcli dev disconnect wlan0`, or keep the connection and follow
+[staying connected to Wi-Fi while collecting CSI](#staying-connected-to-wi-fi-while-collecting-csi-raspberry-pi).
+`net-tools` is not installed by default either, so use `ip link set wlan0 up`
+rather than `ifconfig wlan0 up`.
+
+### Raspberry Pi OS with kernel 4.19, 5.4 or 5.10
 
 For Raspbian / Raspberry Pi OS running kernel versions 4.19, 5.4, and 5.10 perform the following on your Raspberry Pi 3B+/4B:
 1. Make sure the following commands are executed as root: `sudo su`

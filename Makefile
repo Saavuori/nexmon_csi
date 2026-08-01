@@ -31,7 +31,20 @@ else
 B43VERSION=b43
 endif
 
-ADBSERIAL := 
+# 64-bit Raspberry Pi OS reports aarch64. It is the default image on a Pi 4 and
+# the only option on a Pi 5, so leaving it out of these checks did not skip an
+# unsupported platform, it turned the normal install into a no-op that still
+# exited 0 and left the chip on stock firmware.
+RPI_ARCHS=armv6l armv7l armv8l aarch64 arm64
+# Kernels the bundled patched brcmfmac trees can actually be built against.
+# Everything newer runs the stock driver and reaches the firmware through
+# nl80211 vendor commands instead - that is what Makefile.rpi is for.
+LEGACY_KERNELS=4.19 5.4 5.10
+# Compare major.minor exactly. $(findstring 5.4,...) also matches 5.40 and
+# 6.5.4, which would pick a driver tree at random for a future kernel.
+KERNEL_MM=$(shell uname -r | cut -d. -f1-2)
+
+ADBSERIAL :=
 ADBFLAGS := $(ADBSERIAL)
 
 REMOTEADDR := $(REMOTEADDR)
@@ -99,21 +112,24 @@ init: FORCE
 # only make for bcm43455c0
 ifneq ($(findstring bcm43455c0,$(FWUCODE)), )
 brcmfmac.ko: check-nexmon-setup-env
-ifeq ($(shell uname -m),$(filter $(shell uname -m), armv6l armv7l))
-ifeq ($(findstring 4.19,$(shell uname -r)),4.19)
+ifeq ($(shell uname -m),$(filter $(shell uname -m), $(RPI_ARCHS)))
+ifeq ($(KERNEL_MM),4.19)
 	@printf "\033[0;31m  BUILDING DRIVER for kernel 4.19\033[0m brcmfmac_4.19.y-nexmon/brcmfmac.ko (details: log/driver.log)\n" $@
 	$(Q)make -C /lib/modules/$(shell uname -r)/build M=$$PWD/brcmfmac_4.19.y-nexmon -j2 >log/driver.log
-else ifeq ($(findstring 5.4,$(shell uname -r)),5.4)
+else ifeq ($(KERNEL_MM),5.4)
 	@printf "\033[0;31m  BUILDING DRIVER for kernel 5.4\033[0m brcmfmac_5.4.y-nexmon/brcmfmac.ko (details: log/driver.log)\n" $@
 	$(Q)make -C /lib/modules/$(shell uname -r)/build M=$$PWD/brcmfmac_5.4.y-nexmon -j2 >log/driver.log
-else ifeq ($(findstring 5.10,$(shell uname -r)),5.10)
+else ifeq ($(KERNEL_MM),5.10)
 	@printf "\033[0;31m  BUILDING DRIVER for kernel 5.10\033[0m brcmfmac_5.10.y-nexmon/brcmfmac.ko (details: log/driver.log)\n" $@
 	$(Q)make --trace -C /lib/modules/$(shell uname -r)/build M=$$PWD/brcmfmac_5.10.y-nexmon -j1 # >log/driver.log
 else
-	$(warning Warning: Kernel version not supported)
+	$(error Kernel $(KERNEL_MM) has no patched brcmfmac in this repository (only $(LEGACY_KERNELS)). \
+	  It is not needed either: the stock driver accepts firmware commands as nl80211 vendor \
+	  commands, so build nexutil with USE_VENDOR_CMD=1 and install the firmware with \
+	  'make -f Makefile.rpi install-firmware')
 endif
 else
-	$(warning Warning: Driver can not be compiled on this platform, execute the make command on a raspberry pi)
+	$(error Driver cannot be compiled on $(shell uname -m), run make on the Raspberry Pi itself)
 endif
 endif
 
@@ -312,32 +328,55 @@ endif
 
 # bcm43455c0
 ifneq ($(findstring bcm43455c0,$(FWUCODE)), )
+# brcm/brcmfmac43455-sdio.bin is the head of a symlink chain into cypress/ on
+# current Raspberry Pi OS, so back up what it resolves to rather than the link.
 backup-firmware:
-ifeq ($(shell uname -m),$(filter $(shell uname -m), armv6l armv7l))
-	$(Q)cp /lib/firmware/brcm/brcmfmac43455-sdio.bin brcmfmac43455-sdio.bin.orig
+ifeq ($(shell uname -m),$(filter $(shell uname -m), $(RPI_ARCHS)))
+	@printf "\033[0;31m  BACKING UP\033[0m the packaged firmware\n"
+	$(Q)cp "$$(readlink -f /lib/firmware/brcm/brcmfmac43455-sdio.bin)" brcmfmac43455-sdio.bin.orig
 else
-	$(warning Warning: Cannot backup the original firmware on this arch.)
+	$(error Cannot back up the original firmware on $(shell uname -m))
 endif
 
+# The install below uses 'cp --remove-destination' so that the symlink at
+# brcm/brcmfmac43455-sdio.bin is replaced. A plain cp follows it through to
+# cypress/cyfmac43455-sdio.bin and truncates the distro's own firmware, after
+# which there is nothing left to restore. The module to load is also chosen
+# before anything is unloaded, so an unsupported kernel can no longer take the
+# driver down and then fail to bring it back - that left the Pi with no wlan0.
+ifneq ($(filter $(LEGACY_KERNELS),$(KERNEL_MM)), )
 install-firmware: brcmfmac43455-sdio.bin brcmfmac.ko
-ifeq ($(shell uname -m),$(filter $(shell uname -m), armv6l armv7l))
-	@printf "\033[0;31m  COPYING\033[0m brcmfmac43455-sdio.bin => /lib/firmware/brcm/brcmfmac43455-sdio.bin\n"
-	$(Q)sudo cp brcmfmac43455-sdio.bin /lib/firmware/brcm/brcmfmac43455-sdio.bin
-ifeq ($(shell lsmod | grep "^brcmfmac" | wc -l), 1)
-	@printf "\033[0;31m  UNLOADING\033[0m brcmfmac\n"
-	$(Q)sudo rmmod brcmfmac
+else
+install-firmware: brcmfmac43455-sdio.bin
 endif
-	$(Q)sudo modprobe brcmutil
+ifeq ($(shell uname -m),$(filter $(shell uname -m), $(RPI_ARCHS)))
+ifneq ($(filter $(LEGACY_KERNELS),$(KERNEL_MM)), )
+	@printf "\033[0;31m  BACKING UP\033[0m the packaged firmware\n"
+	$(Q)target=$$(readlink -f /lib/firmware/brcm/brcmfmac43455-sdio.bin); \
+	    [ -e "$$target.orig" ] || sudo cp "$$target" "$$target.orig"
+	@printf "\033[0;31m  COPYING\033[0m brcmfmac43455-sdio.bin => /lib/firmware/brcm/brcmfmac43455-sdio.bin\n"
+	$(Q)sudo cp --remove-destination brcmfmac43455-sdio.bin /lib/firmware/brcm/brcmfmac43455-sdio.bin
 	@printf "\033[0;31m  RELOADING\033[0m brcmfmac\n"
-ifeq ($(findstring 4.19,$(shell uname -r)),4.19)
-	$(Q)sudo insmod brcmfmac_4.19.y-nexmon/brcmfmac.ko
-else ifeq ($(findstring 5.4,$(shell uname -r)),5.4)
-	$(Q)sudo insmod brcmfmac_5.4.y-nexmon/brcmfmac.ko
-else ifeq ($(findstring 5.10,$(shell uname -r)),5.10)
-	$(Q)sudo insmod brcmfmac_5.10.y-nexmon/brcmfmac.ko
+	$(Q)set -e; \
+	    case "$(KERNEL_MM)" in \
+	        4.19) ko=brcmfmac_4.19.y-nexmon/brcmfmac.ko ;; \
+	        5.4)  ko=brcmfmac_5.4.y-nexmon/brcmfmac.ko ;; \
+	        5.10) ko=brcmfmac_5.10.y-nexmon/brcmfmac.ko ;; \
+	    esac; \
+	    if lsmod | awk '$$1 == "brcmfmac" { hit = 1 } END { exit !hit }'; then \
+	        printf "  unloading brcmfmac\n"; sudo rmmod brcmfmac; \
+	    fi; \
+	    sudo modprobe brcmutil; \
+	    sudo insmod "$$ko"
+else
+	$(error Kernel $(KERNEL_MM) has no patched brcmfmac in this repository (only $(LEGACY_KERNELS)). \
+	  Current Raspberry Pi OS runs the stock driver, which takes firmware commands as nl80211 \
+	  vendor commands - use 'make -f Makefile.rpi install-firmware' instead, and build nexutil \
+	  with USE_VENDOR_CMD=1)
 endif
 else
-	$(warning Warning: Cannot install firmware on this arch., bcm43430-sdio.bin needs to be copied manually into /lib/firmware/brcm/ on your RPI3)
+	$(error Cannot install firmware on $(shell uname -m). Build the image here and copy \
+	  brcmfmac43455-sdio.bin to /lib/firmware/brcm/ on the Raspberry Pi by hand)
 endif
 
 clean-firmware: FORCE
@@ -345,14 +384,14 @@ clean-firmware: FORCE
 	$(Q)rm -fr $(RAM_FILE) obj gen log src/ucode_compressed.c src/templateram.c src/*.asm
 
 clean: clean-firmware
-ifeq ($(shell uname -m),$(filter $(shell uname -m), armv6l armv7l))
-ifeq ($(findstring 4.19,$(shell uname -r)),4.19)
+ifeq ($(shell uname -m),$(filter $(shell uname -m), $(RPI_ARCHS)))
+ifeq ($(KERNEL_MM),4.19)
 	@printf "\033[0;31m  CLEANING DRIVER\033[0m\n" $@
 	$(Q)make -C /lib/modules/$(shell uname -r)/build M=$$PWD/brcmfmac_4.19.y-nexmon clean
-else ifeq ($(findstring 5.4,$(shell uname -r)),5.4)
+else ifeq ($(KERNEL_MM),5.4)
 	@printf "\033[0;31m  CLEANING DRIVER\033[0m\n" $@
 	$(Q)make -C /lib/modules/$(shell uname -r)/build M=$$PWD/brcmfmac_5.4.y-nexmon clean
-else ifeq ($(findstring 5.10,$(shell uname -r)),5.10)
+else ifeq ($(KERNEL_MM),5.10)
 	@printf "\033[0;31m  CLEANING DRIVER\033[0m\n" $@
 	$(Q)make -C /lib/modules/$(shell uname -r)/build M=$$PWD/brcmfmac_5.10.y-nexmon clean
 endif

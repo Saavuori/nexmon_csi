@@ -99,17 +99,50 @@ ip link show "$IFACE" >/dev/null 2>&1 || die "interface '$IFACE' does not exist"
 # to miss because nexutil reports the failure on stderr but still exits 0, which
 # is why nothing below trusts its exit status: every write is read back instead.
 
-# A plain chanspec query. Any brcmfmac firmware answers it, so it tells us
-# whether the transport works without saying anything about the firmware.
-transport_works() {
-    nexutil -I"$IFACE" -k 2>/dev/null | grep -q 'chanspec'
+# nexutil has no "print this get as a number" option: -i only controls how the
+# *input* to a set is parsed, and a get is hex dumped unless -r or -R is given.
+# Reading the raw bytes and decoding them here avoids parsing column-formatted
+# text - the previous version scanned the hexdump for the last field that looked
+# like an integer, which is the trailing padding byte, so it reported 0 for
+# every possible value and made a successful start look like a failure.
+nexutil_get_u16() {
+    nexutil -I"$IFACE" -g"$1" -l4 -r 2>/dev/null | od -An -tu2 -N2 | tr -d '[:space:]'
 }
 
-# ioctl 501 exists only in the nexmon CSI firmware and returns csi_collect.
-# Empty means the firmware did not answer, '0'/'1' is the current state.
+nexutil_get_u32_hex() {
+    nexutil -I"$IFACE" -g"$1" -l4 -r 2>/dev/null | od -An -tx4 -N4 | tr -d '[:space:]'
+}
+
+# WLC_GET_MAGIC (ioctl 0) answers 0x14e46c77 on every Broadcom firmware, so a
+# correct answer proves nexutil reached the chip without saying anything about
+# which firmware is running. Querying the chanspec cannot do that job: nexutil
+# prints 'chanspec: ...' out of its own buffer whether or not the ioctl ever
+# got there, so grepping for that word succeeded even against a dead transport.
+transport_works() {
+    [ "$(nexutil_get_u32_hex 0)" = "14e46c77" ]
+}
+
+# ioctl 501 returns csi_collect out of shared memory. Note that a firmware
+# *without* the extractor does not fail this in a way nexutil surfaces - it
+# hands back the untouched buffer, which reads as a perfectly plausible 0 - so
+# this answers "did the extractor take my configuration", not "is the CSI
+# firmware running". csi_firmware_state below answers the latter.
 csi_collect_state() {
-    nexutil -I"$IFACE" -g501 -i 2>/dev/null |
-        awk '{ for (i = NF; i >= 1; i--) if ($i ~ /^-?[0-9]+$/) { print $i + 0; exit } }'
+    nexutil_get_u16 501
+}
+
+# The banner the driver logs when the chip attaches is the one direct statement
+# of which image is running, and the nexmon build marks itself there. dmesg can
+# have rotated past it on a long-lived system, hence the third answer.
+csi_firmware_state() {
+    banner=$(dmesg 2>/dev/null | grep -i 'brcmfmac.*Firmware:' | tail -n 1)
+    if [ -z "$banner" ]; then
+        echo unknown
+    elif echo "$banner" | grep -qi nexmon; then
+        echo nexmon
+    else
+        echo stock
+    fi
 }
 
 require_firmware_access() {
@@ -131,9 +164,26 @@ EOF
         exit 1
     fi
 
-    # ioctl 501 also needs the chip to be up, so say so rather than blaming the
-    # firmware for what may just be a down interface
-    [ -n "$(csi_collect_state)" ] || die "nexutil reaches $IFACE but ioctl 501 gets no answer - either the interface is down ('ip link set $IFACE up') or the running firmware is not the nexmon CSI build ('make -f Makefile.rpi install-firmware', then reload the driver)"
+    case "$(csi_firmware_state)" in
+    stock)
+        cat >&2 <<EOF
+error: $IFACE is running stock firmware, not the nexmon CSI build
+
+Install and activate the CSI firmware, which also reloads the driver so the chip
+actually reads it:
+
+  make -f Makefile.rpi install-firmware
+
+Installing the image without reloading changes nothing: the chip only reads its
+firmware while the driver attaches.
+EOF
+        exit 1
+        ;;
+    unknown)
+        warn "could not read the firmware banner from dmesg, continuing anyway"
+        warn "if no CSI arrives, confirm the CSI firmware is active with 'make -f Makefile.rpi install-firmware'"
+        ;;
+    esac
 }
 
 # Reads "<channel> <bandwidth>" from the running association, e.g. "36 80".
@@ -164,15 +214,25 @@ show_status() {
     echo "channel:    ${1:-unknown} @ ${2:-unknown} MHz"
     chanspec=$(nexutil -I"$IFACE" -k 2>/dev/null | sed 's/^chanspec: *//')
     echo "chanspec:   ${chanspec:-unavailable}"
-    collect=$(csi_collect_state)
-    if [ -n "$collect" ]; then
+    if transport_works; then
         echo "nexutil:    reaches the firmware"
-        echo "csi:        $collect"
-    elif transport_works; then
-        echo "nexutil:    reaches the firmware, but it is not the nexmon CSI build"
-        echo "csi:        unavailable"
+        case "$(csi_firmware_state)" in
+        nexmon)
+            echo "firmware:   nexmon CSI build"
+            echo "csi:        $(csi_collect_state)"
+            ;;
+        stock)
+            echo "firmware:   stock, no extractor - run 'make -f Makefile.rpi install-firmware'"
+            echo "csi:        unavailable"
+            ;;
+        *)
+            echo "firmware:   unknown, dmesg has no brcmfmac banner left"
+            echo "csi:        $(csi_collect_state) (meaningless unless the CSI build is running)"
+            ;;
+        esac
     else
         echo "nexutil:    cannot reach the driver, rebuild it with USE_VENDOR_CMD=1"
+        echo "firmware:   unknown"
         echo "csi:        unavailable"
     fi
     powersave=$(iw dev "$IFACE" get power_save 2>/dev/null | sed -n 's/.*Power save: //p')

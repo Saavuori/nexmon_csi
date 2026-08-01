@@ -13,9 +13,31 @@ FW_SRCS=$(wildcard $(FW_PATH)/*.c)
 UCODEFILE:=
 SPLITPATH=$(subst /, ,$(FW_PATH))
 FWUCODE=$(word $(shell expr $(words $(SPLITPATH)) - 1),$(SPLITPATH)).$(lastword $(SPLITPATH)).patch
-UCODES=$(filter %$(FWUCODE),$(notdir $(wildcard src/*.patch)))
+ALL_UCODES=$(notdir $(wildcard src/*.patch))
+UCODES=$(filter %$(FWUCODE),$(ALL_UCODES))
 ifeq ($(UCODEFILE),)
 UCODEFILE=csi.ucode.$(FWUCODE)
+endif
+
+# Every CSI hook is placed at an address that was reverse engineered for one
+# specific firmware build - see the __attribute__((at(..., CHIP_VER_x, FW_VER_y)))
+# lists in src/ioctl.c and src/csi_extractor.c - and the ucode diff only applies
+# to that build's ucode.bin. Build under a firmware version that has neither and
+# the hooks are simply dropped: you get a firmware image that flashes fine and
+# contains no extractor. That is worth refusing outright, because the failure
+# otherwise surfaces much later as "tcpdump sees no CSI" with nothing to point
+# at. Without this check make dies at 'No rule to make target
+# src/ucode_compressed.c' instead, which says nothing about the real problem.
+CSI_PORTS=$(patsubst csi.ucode.%.patch,%,$(ALL_UCODES))
+NONBUILD_GOALS=clean clean-firmware csi-stop csi-status restore-wifi reload-driver
+ifeq ($(filter $(UCODEFILE),$(UCODES)), )
+ifneq ($(filter-out $(NONBUILD_GOALS),$(or $(MAKECMDGOALS),all)), )
+$(error nexmon_csi has no CSI port for $(basename $(FWUCODE)). \
+  Ported firmware versions: $(CSI_PORTS). \
+  On a Raspberry Pi this repository has to be cloned into and built from \
+  $$NEXMON_ROOT/patches/bcm43455c0/7_45_189/ - newer 43455 firmware directories \
+  exist in nexmon but no CSI addresses have been reversed for them)
+endif
 endif
 
 LOCAL_SRCS=$(wildcard src/*.c) src/ucode_compressed.c
@@ -193,34 +215,44 @@ src/templateram.c: $(FW_PATH)/templateram.bin
 
 ###################################################################
 
+# /proc/cpuinfo only carries a Model line thanks to a Raspberry Pi downstream
+# kernel patch, so it vanishes under a mainline or Ubuntu arm64 kernel on the
+# very same board. The device tree model is published by the firmware itself and
+# is there either way, so prefer it and keep cpuinfo as the fallback.
 is-rpi: FORCE
-ifeq (,$(findstring Raspberry Pi,$(file < /proc/cpuinfo)))
-	$(error Error: Device is not Raspberry Pi. Install firmware manually or use nexmon directly on your Raspberry Pi. Exit..)
-endif
+	$(Q)model=$$(tr -d '\0' < /proc/device-tree/model 2>/dev/null); \
+	if [ -z "$$model" ]; then \
+	    model=$$(sed -n 's/^Model[[:space:]]*:[[:space:]]*//p' /proc/cpuinfo 2>/dev/null); \
+	fi; \
+	case "$$model" in \
+	    *"Raspberry Pi"*) ;; \
+	    *) echo "error: this target has to run on the Raspberry Pi itself (detected: $${model:-unknown device})" >&2; \
+	       echo "Build the firmware image here with 'make -f Makefile.rpi' and install it on the Pi." >&2; \
+	       exit 1 ;; \
+	esac
 
 reload-driver: is-rpi
-	@printf "\033[0;31m  UNLOADING DRIVER\033[0m %s\n" "brcmfmac_wcc"
-	$(Q)sudo modprobe -r brcmfmac_wcc
-	@printf "\033[0;31m  LOADING DRIVER\033[0m %s\n" "brcmfmac_wcc"
-	$(Q)sudo modprobe brcmfmac_wcc
-	$(Q)sleep 2
+	@printf "\033[0;31m  RELOADING DRIVER\033[0m %s\n" "brcmfmac"
+	$(Q)sudo utils/reload-brcmfmac.sh -i $(IFACE)
 
 unmanage: is-rpi
-	@printf "\033[0;31m  NetworkManager DISCONNECT[0m %s\n" "wlan0"
-	$(Q)sudo nmcli dev disconnect wlan0
-	@printf "\033[0;31m  NetworkManager UNMANAGE\033[0m %s\n" "wlan0"
-	$(Q)sudo nmcli dev set wlan0 managed no
-	@printf "\033[0;31m  NetworkManager RADIO OFF\033[0m %s\n" "wlan0"
+	@printf "\033[0;31m  NetworkManager DISCONNECT\033[0m %s\n" "$(IFACE)"
+	$(Q)sudo nmcli dev disconnect $(IFACE)
+	@printf "\033[0;31m  NetworkManager UNMANAGE\033[0m %s\n" "$(IFACE)"
+	$(Q)sudo nmcli dev set $(IFACE) managed no
+	@printf "\033[0;31m  NetworkManager RADIO OFF\033[0m %s\n" "$(IFACE)"
 	$(Q)sudo nmcli radio wifi off
 	@printf "\033[0;31m  UNBLOCK RADIO\033[0m\n"
 	$(Q)sudo rfkill unblock wifi
 
+# 'ip' replaces ifconfig here because net-tools is not part of a default
+# bookworm or trixie install, and nexutil needs root like every other write.
 reload-full: reload-driver
-	@printf "\033[0;31m  BRINGUP INTERFACE\033[0m %s\n" "wlan0"
-	$(Q)sudo ifconfig wlan0 up
+	@printf "\033[0;31m  BRINGUP INTERFACE\033[0m %s\n" "$(IFACE)"
+	$(Q)sudo ip link set $(IFACE) up
 	@printf "\033[0;31m  DISABLE\033[0m Power Save\n"
-	$(Q)sudo iw dev wlan0 set power_save off
-	$(Q)nexutil -s86 -i -v0
+	$(Q)sudo iw dev $(IFACE) set power_save off
+	$(Q)sudo nexutil -I$(IFACE) -s86 -i -v0
 
 # nexutil has to speak a transport the running driver serves. Its default ioctl
 # transport and its -DUSE_NETLINK transport both need nexmon's patched brcmfmac,
@@ -254,33 +286,103 @@ csi-stop: is-rpi
 csi-status: is-rpi
 	$(Q)sudo utils/csi-connected.sh -i $(IFACE) --status
 
-install-firmware: $(RAM_FILE) is-rpi
-	@printf "\033[0;31m  COPYING\033[0m %s => /lib/firmware/nexmon/%s\n" $(RAM_FILE) $(RAM_FILE)
-	$(Q)sudo mkdir -p /lib/firmware/nexmon
-	$(Q)sudo cp $(RAM_FILE) /lib/firmware/nexmon/$(RAM_FILE)
-	@printf "\033[0;31m  SETTING FIRMWARE ALTERNATIVE\033[0m cyfmac43455-sdio.bin to /lib/firmware/nexmon/%s\n" $(RAM_FILE)
-	$(Q)sudo update-alternatives --install /lib/firmware/cypress/cyfmac43455-sdio.bin cyfmac43455-sdio.bin /lib/firmware/nexmon/$(RAM_FILE) 30
-	$(Q)sudo update-alternatives --set cyfmac43455-sdio.bin /lib/firmware/nexmon/$(RAM_FILE)
+# The 43455 firmware is shipped as a Debian alternative, so the path the driver
+# ends up reading is reached through two symlinks:
+#
+#   brcm/brcmfmac43455-sdio.<board>.bin -> brcm/brcmfmac43455-sdio.bin
+#                                       -> cypress/cyfmac43455-sdio.bin   (the alternative)
+#                                       -> cypress/cyfmac43455-sdio-standard.bin
+#
+# Both the board specific name a Pi 5 asks for and the generic fallback resolve
+# to the alternative, which is why pointing the alternative at our image is
+# enough and why copying over brcm/brcmfmac43455-sdio.bin directly is not just
+# unnecessary but harmful: cp follows the links and truncates the distro's own
+# firmware, after which --auto has nothing left to restore.
+FW_ALTNAME=cyfmac43455-sdio.bin
+FW_NEXMON_DIR=/lib/firmware/nexmon
 
+# Where the alternative keeps its link moved between releases - bookworm has it
+# under /lib/firmware, trixie under /usr/lib/firmware - and registering a second
+# path for a name that already exists silently does nothing at all. So ask
+# update-alternatives where the link is instead of hardcoding either answer.
+install-firmware: $(RAM_FILE) is-rpi
+	@printf "\033[0;31m  COPYING\033[0m %s => %s/%s\n" $(RAM_FILE) $(FW_NEXMON_DIR) $(RAM_FILE)
+	$(Q)sudo mkdir -p $(FW_NEXMON_DIR)
+	$(Q)sudo cp $(RAM_FILE) $(FW_NEXMON_DIR)/$(RAM_FILE)
+	$(Q)set -e; \
+	link=$$(update-alternatives --query $(FW_ALTNAME) 2>/dev/null | sed -n 's/^Link: //p' | head -n 1); \
+	if [ -z "$$link" ]; then \
+	    if [ -d /usr/lib/firmware/cypress ]; then link=/usr/lib/firmware/cypress/$(FW_ALTNAME); \
+	    else link=/lib/firmware/cypress/$(FW_ALTNAME); fi; \
+	fi; \
+	printf "\033[0;31m  SETTING FIRMWARE ALTERNATIVE\033[0m %s => %s/%s\n" "$$link" "$(FW_NEXMON_DIR)" "$(RAM_FILE)"; \
+	if [ -e "$$link" ] && [ ! -L "$$link" ]; then \
+	    printf "\033[0;31m  BACKING UP\033[0m %s => %s.orig\n" "$$link" "$$link"; \
+	    sudo cp -n "$$link" "$$link.orig"; \
+	    sudo rm -f "$$link"; \
+	fi; \
+	sudo update-alternatives --install "$$link" $(FW_ALTNAME) $(FW_NEXMON_DIR)/$(RAM_FILE) 30; \
+	sudo update-alternatives --set $(FW_ALTNAME) $(FW_NEXMON_DIR)/$(RAM_FILE)
+ifeq ($(RELOAD_DRIVER),0)
+	@printf "\033[0;31m  SKIPPING RELOAD\033[0m (RELOAD_DRIVER=0)\n"
+	@printf "  the chip still runs its old firmware until the driver reattaches:\n"
+	@printf "  sudo utils/reload-brcmfmac.sh -i %s\n" "$(IFACE)"
+else
+	@printf "\033[0;31m  RELOADING DRIVER\033[0m so the chip reads the new image\n"
+	@printf "  this drops the Wi-Fi link - pass RELOAD_DRIVER=0 if you are connected over %s\n" "$(IFACE)"
+	$(Q)sudo utils/reload-brcmfmac.sh -i $(IFACE)
+	@printf "\033[0;31m  VERIFYING\033[0m the running firmware\n"
+	$(Q)banner=$$(sudo dmesg | grep -i 'brcmfmac.*Firmware:' | tail -n 1); \
+	case "$$banner" in \
+	    *nexmon*) printf "  running: %s\n" "$${banner#*Firmware: }" ;; \
+	    "") echo "error: the driver logged no firmware banner, so the chip did not attach - check 'dmesg | tail'" >&2; exit 1 ;; \
+	    *) echo "error: the chip came up on firmware that is not the nexmon CSI build:" >&2; \
+	       echo "  $${banner#*Firmware: }" >&2; \
+	       echo "The alternative was set, so something else answered the driver's request first." >&2; \
+	       echo "Check 'update-alternatives --display $(FW_ALTNAME)', and whether a board specific" >&2; \
+	       echo "firmware file exists as a real file instead of a symlink to the alternative -" >&2; \
+	       echo "the driver asks for brcm/brcmfmac43455-sdio.<board>.bin before the generic name," >&2; \
+	       echo "for example brcm/brcmfmac43455-sdio.raspberrypi,5-model-b.bin on a Pi 5." >&2; \
+	       exit 1 ;; \
+	esac
+endif
+
+# --auto on its own is not enough to undo the install. It picks the highest
+# priority *registered* alternative, and if the distro never registered one -
+# which is the case when install-firmware had to convert a real file into an
+# alternative - then ours is the only candidate and --auto happily reselects it,
+# reporting success while leaving the CSI firmware in place.
 restore-wifi: is-rpi
-	@printf "\033[0;31m  SETTING FIRMWARE ALTERNATIVE\033[0m to default cyfmac43455-sdio.bin\n"
-	$(Q)sudo update-alternatives --auto cyfmac43455-sdio.bin
-	@printf "\033[0;31m  UNLOADING DRIVER\033[0m %s\n" "brcmfmac_wcc"
-	$(Q)sudo modprobe -r brcmfmac_wcc
-	@printf "\033[0;31m  LOADING DRIVER\033[0m %s\n" "brcmfmac_wcc"
-	$(Q)sudo modprobe brcmfmac_wcc
-	$(Q)sleep 2
-	@printf "\033[0;31m  BRINGUP INTERFACE\033[0m %s\n" "wlan0"
-	$(Q)sudo ifconfig wlan0 up
+	@printf "\033[0;31m  SETTING FIRMWARE ALTERNATIVE\033[0m to default $(FW_ALTNAME)\n"
+	$(Q)set -e; \
+	link=$$(update-alternatives --query $(FW_ALTNAME) 2>/dev/null | sed -n 's/^Link: //p' | head -n 1); \
+	others=$$(update-alternatives --query $(FW_ALTNAME) 2>/dev/null | sed -n 's/^Alternative: //p' | grep -v "^$(FW_NEXMON_DIR)/" || true); \
+	if [ -n "$$others" ]; then \
+	    sudo update-alternatives --auto $(FW_ALTNAME); \
+	else \
+	    printf "  no packaged alternative is registered, restoring the saved original\n"; \
+	    sudo update-alternatives --remove $(FW_ALTNAME) $(FW_NEXMON_DIR)/$(RAM_FILE) || true; \
+	    if [ -e "$$link.orig" ]; then \
+	        sudo cp "$$link.orig" "$$link"; \
+	    else \
+	        echo "error: no $$link.orig to restore - reinstall the distro firmware with" >&2; \
+	        echo "  sudo apt install --reinstall firmware-brcm80211" >&2; \
+	        exit 1; \
+	    fi; \
+	fi
+	@printf "\033[0;31m  RELOADING DRIVER\033[0m %s\n" "brcmfmac"
+	$(Q)sudo utils/reload-brcmfmac.sh -i $(IFACE)
+	@printf "\033[0;31m  BRINGUP INTERFACE\033[0m %s\n" "$(IFACE)"
+	$(Q)sudo ip link set $(IFACE) up
 	@printf "\033[0;31m  UNBLOCK RADIO\033[0m\n"
 	$(Q)sudo rfkill unblock wifi
-	@printf "\033[0;31m  NetworkManager MANAGE\033[0m %s\n" "wlan0"
-	$(Q)sudo nmcli dev set wlan0 managed yes
-	@printf "\033[0;31m  NetworkManager RADIO ON\033[0m %s\n" "wlan0"
+	@printf "\033[0;31m  NetworkManager MANAGE\033[0m %s\n" "$(IFACE)"
+	$(Q)sudo nmcli dev set $(IFACE) managed yes
+	@printf "\033[0;31m  NetworkManager RADIO ON\033[0m %s\n" "$(IFACE)"
 	$(Q)sudo nmcli radio wifi on
 	$(Q)sleep 1
-	@printf "\033[0;31m  NetworkManager CONNECT\033[0m %s\n" "wlan0"
-	$(Q)sudo nmcli dev connect wlan0
+	@printf "\033[0;31m  NetworkManager CONNECT\033[0m %s\n" "$(IFACE)"
+	$(Q)sudo nmcli dev connect $(IFACE)
 
 clean-firmware: FORCE
 	$(Q)rm -fr $(RAM_FILE) obj gen log src/ucode_compressed.c src/templateram.c
