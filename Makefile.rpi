@@ -222,7 +222,21 @@ reload-full: reload-driver
 	$(Q)sudo iw dev wlan0 set power_save off
 	$(Q)nexutil -s86 -i -v0
 
-install-csi-tools: is-rpi
+# nexutil has to speak a transport the running driver serves. Its default ioctl
+# transport and its -DUSE_NETLINK transport both need nexmon's patched brcmfmac,
+# which exists only for kernels 4.19, 5.4 and 5.10. Every Raspberry Pi OS past
+# those loads the stock driver, which takes firmware commands as nl80211 vendor
+# commands - hence USE_VENDOR_CMD=1. Build it wrong and nexutil still exits 0
+# while configuring nothing, so this is worth getting right once.
+# 'clean' first: objects left from an earlier build keep the old transport.
+install-nexutil: is-rpi
+	@printf "\033[0;31m  BUILDING\033[0m %s\n" "nexutil (USE_VENDOR_CMD=1)"
+	$(Q)make -C $(NEXMON_ROOT)/utilities/nexutil clean
+	$(Q)make -C $(NEXMON_ROOT)/utilities/nexutil USE_VENDOR_CMD=1
+	@printf "\033[0;31m  INSTALLING\033[0m %s\n" "nexutil"
+	$(Q)sudo make -C $(NEXMON_ROOT)/utilities/nexutil USE_VENDOR_CMD=1 install
+
+install-csi-tools: is-rpi install-nexutil
 	@printf "\033[0;31m  BUILDING\033[0m %s\n" "makecsiparams"
 	$(Q)make -C utils/makecsiparams
 	@printf "\033[0;31m  INSTALLING\033[0m %s\n" "makecsiparams"
